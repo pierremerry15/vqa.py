@@ -4,131 +4,366 @@ from PIL import Image
 import os
 import csv
 import pandas as pd
-from sklearn.metrics import precision_score, recall_score, f1_score
 from collections import defaultdict
 
-# Initialize BLIP processor and model
-processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
-blip_model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-base")
+# Initialize BLIP processor and model for VQA
+print("Loading BLIP model...")
+from transformers import BlipForQuestionAnswering
+processor = BlipProcessor.from_pretrained("Salesforce/blip-vqa-base")
+blip_model = BlipForQuestionAnswering.from_pretrained("Salesforce/blip-vqa-base")
+device = "cuda" if torch.cuda.is_available() else "cpu"
+blip_model = blip_model.to(device)
+print(f"Using device: {device}")
 
-# Directory wimaghere images are stored
-image_folder = 'ship_images/'  # Ensure this is the correct folder path
-output_csv = 'vqa_results.csv'  # Output CSV for storing results
+# Base directory for images
+base_folder = 'VQA_Ship_Images./TADMUS Image Augmentation/'
 
-# Your questions
-questions = [
-    "What is the name of the ship in this image?", 
-    "Which country does this ship in this image belong to?", 
-    "What type of ship is shown in this image?", 
-    "What is the ship's hull number?"
+# Define resize factors and their corresponding folders
+resize_configs = [
+    (0.125, '0.125_factor_resized-ship-set-copy', 'Genfill'),
+    (0.125, '0.125_ps_factor_resized-ship-set-copy', 'Manual'),
+    (0.25, '0.25_factor_resized-ship-set-copy', 'Genfill'),
+    (0.25, '0.25_ps_factor_resized-ship-set-copy', 'Manual'),
+    (0.5, '0.5_factor_resized-ship-set-copy', 'Genfill'),
+    (0.5, '0.5_ps_factor_resized-ship-set-copy', 'Manual'),
 ]
 
-# Initialize dictionaries for tracking results
-accuracy_by_type = defaultdict(int)
-accuracy_by_country = defaultdict(int)
-accuracy_by_resize = defaultdict(int)
-accuracy_by_prompt = defaultdict(int)
-all_labels = []
-all_preds = []
+# Questions for VQA
+questions = {
+    'ship_name': "What is the name of the ship?",
+    'country': "Which country does this ship belong to?",
+    'ship_type': "What type of ship is this?",
+    'hull_number': "What is the hull number?"
+}
 
-# Helper function to calculate metrics (precision, recall, F1)
-def calculate_metrics(labels, preds):
-    precision = precision_score(labels, preds, average='macro', zero_division=0)
-    recall = recall_score(labels, preds, average='macro', zero_division=0)
-    f1 = f1_score(labels, preds, average='macro', zero_division=0)
-    return precision, recall, f1
-
-# Open the CSV file for writing results
-with open(output_csv, 'w', newline='') as csvfile:
-    csvwriter = csv.writer(csvfile)
-    header = ['image_name'] + questions + ['type', 'country', 'resize_factor', 'prompt_method']
-    csvwriter.writerow(header)
-
-    # Loop through image files
-    for image_name in os.listdir(image_folder):
-        image_path = os.path.join(image_folder, image_name)
+# Parse filename to extract ground truth
+def parse_filename(filename):
+    """
+    Parse filename format: Country_ShipType_ShipName(HullNumber)_Index.jpeg
+    Example: USA_Destroyer_USS Forrest Sherman (DDG-98)_0.jpeg
+    """
+    try:
+        # Remove extension
+        name = filename.replace('.jpeg', '').replace('.jpg', '')
         
-        if image_name.lower().endswith('.jpg') or image_name.lower().endswith('.jpeg'):  # Ensuring it's an image file
-            row = [image_name]
-            
-            # Open image and convert it to RGB (safer image loading)
+        # Split by underscore
+        parts = name.split('_')
+        
+        if len(parts) < 3:
+            return None
+        
+        country = parts[0].strip()
+        ship_type = parts[1].strip()
+        
+        # Join remaining parts for ship name (may contain underscores)
+        ship_name_part = '_'.join(parts[2:])
+        
+        # Extract hull number if present (in parentheses)
+        hull_number = ''
+        ship_name = ship_name_part
+        
+        if '(' in ship_name_part and ')' in ship_name_part:
+            start = ship_name_part.index('(')
+            end = ship_name_part.index(')')
+            hull_number = ship_name_part[start+1:end].strip()
+            ship_name = ship_name_part[:start].strip()
+            # Remove trailing index after parentheses
+            remaining = ship_name_part[end+1:]
+            if remaining and remaining.startswith('_'):
+                pass  # This is just the index, ignore it
+        
+        return {
+            'country': country,
+            'ship_type': ship_type,
+            'ship_name': ship_name,
+            'hull_number': hull_number
+        }
+    except Exception as e:
+        print(f"Error parsing filename {filename}: {e}")
+        return None
+
+# Store all results
+all_results = []
+
+print("\nProcessing images...")
+total_images = 0
+
+# Process each configuration
+for resize_factor, folder_name, prompt_method in resize_configs:
+    folder_path = os.path.join(base_folder, folder_name)
+    
+    if not os.path.exists(folder_path):
+        print(f"Folder not found: {folder_path}")
+        continue
+    
+    print(f"\nProcessing: {folder_name} (Resize: {resize_factor}, Method: {prompt_method})")
+    
+    image_files = [f for f in os.listdir(folder_path) if f.lower().endswith(('.jpg', '.jpeg'))]
+    
+    for idx, image_name in enumerate(image_files):
+        if idx % 10 == 0:
+            print(f"  Processing image {idx+1}/{len(image_files)}...")
+        
+        # Parse ground truth from filename
+        ground_truth = parse_filename(image_name)
+        if not ground_truth:
+            continue
+        
+        image_path = os.path.join(folder_path, image_name)
+        
+        try:
+            image = Image.open(image_path).convert("RGB")
+        except Exception as e:
+            print(f"Error loading {image_name}: {e}")
+            continue
+        
+        # Ask each question
+        result = {
+            'image_name': image_name,
+            'resize_factor': resize_factor,
+            'prompt_method': prompt_method,
+            'gt_country': ground_truth['country'],
+            'gt_ship_type': ground_truth['ship_type'],
+            'gt_ship_name': ground_truth['ship_name'],
+            'gt_hull_number': ground_truth['hull_number']
+        }
+        
+        for q_key, question in questions.items():
             try:
-                image = Image.open(image_path).convert("RGB")
+                # Process inputs properly for VQA
+                inputs = processor(image, question, return_tensors="pt")
+                # Move inputs to device
+                inputs = {k: v.to(device) for k, v in inputs.items()}
+                out = blip_model.generate(**inputs, max_length=50)
+                answer = processor.decode(out[0], skip_special_tokens=True)
+                
+                # Debug: print first few answers
+                if idx == 0:
+                    print(f"    Q: {question}")
+                    print(f"    A: {answer}")
+                
+                result[f'pred_{q_key}'] = answer
             except Exception as e:
-                print(f"Error processing {image_name}: {e}")
-                continue
+                print(f"Error processing question '{question}' for {image_name}: {e}")
+                import traceback
+                traceback.print_exc()
+                result[f'pred_{q_key}'] = 'ERROR'
+        
+        all_results.append(result)
+        total_images += 1
 
-            # Get ground-truth labels (can be customized as per your data)
-            type_label = 'Destroyer'  # Example, you will replace this with actual data
-            country_label = 'USA'     # Example, you will replace this with actual data
+print(f"\nTotal images processed: {total_images}")
 
-            all_labels.append((type_label, country_label))
+# Save raw results to CSV
+df = pd.DataFrame(all_results)
+df.to_csv('vqa_results.csv', index=False)
+print("Raw results saved to vqa_results.csv")
 
-            # Loop through questions, resize factors, and prompt methods
-            for resize_factor in [0.5, 0.25, 0.125]:
-                resized_image = image.resize((int(image.width * resize_factor), int(image.height * resize_factor)))
+# Calculate accuracy metrics
+def check_match(pred, gt, fuzzy=True):
+    """Check if prediction matches ground truth"""
+    if pd.isna(pred) or pd.isna(gt) or pred == 'ERROR':
+        return False
+    
+    pred_clean = str(pred).lower().strip()
+    gt_clean = str(gt).lower().strip()
+    
+    if fuzzy:
+        # Check if key terms match
+        return gt_clean in pred_clean or pred_clean in gt_clean
+    else:
+        return pred_clean == gt_clean
 
-                for prompt_method in ["genfill", "genfill_prompt", "manual"]:
-                    try:
-                        # Prepare inputs for the model
-                        inputs = processor(images=resized_image, text=questions[0], return_tensors="pt")  # Using the first question as example
-                        out = blip_model.generate(**inputs)
-                        answer = processor.decode(out[0], skip_special_tokens=True)
+# Add correctness columns
+df['correct_country'] = df.apply(lambda row: check_match(row['pred_country'], row['gt_country']), axis=1)
+df['correct_ship_type'] = df.apply(lambda row: check_match(row['pred_ship_type'], row['gt_ship_type']), axis=1)
+df['correct_ship_name'] = df.apply(lambda row: check_match(row['pred_ship_name'], row['gt_ship_name']), axis=1)
+df['correct_hull_number'] = df.apply(lambda row: check_match(row['pred_hull_number'], row['gt_hull_number']), axis=1)
 
-                        row.append(answer)
+print("\n" + "="*80)
+print("ANALYSIS RESULTS")
+print("="*80)
 
-                        # Accuracy tracking by type, country, resize factor, and prompt method
-                        if prompt_method == "genfill":
-                            accuracy_by_prompt['genfill'] += (answer == type_label)
-                        elif prompt_method == "genfill_prompt":
-                            accuracy_by_prompt['genfill_prompt'] += (answer == country_label)
-                        else:
-                            accuracy_by_prompt['manual'] += (answer == type_label)
+# (1) Overall accuracy by answer type
+print("\n1. OVERALL ACCURACY BY ANSWER TYPE:")
+print("-" * 50)
+for answer_type in ['country', 'ship_type', 'ship_name', 'hull_number']:
+    accuracy = df[f'correct_{answer_type}'].mean() * 100
+    print(f"  {answer_type.replace('_', ' ').title()}: {accuracy:.2f}%")
 
-                        # Store accuracy and predictions for final evaluation
-                        all_preds.append(answer)
+# (2a) Accuracy by ship type
+print("\n2a. ACCURACY BY SHIP TYPE:")
+print("-" * 50)
+ship_type_accuracy = df.groupby('gt_ship_type').agg({
+    'correct_country': 'mean',
+    'correct_ship_type': 'mean',
+    'correct_ship_name': 'mean',
+    'correct_hull_number': 'mean'
+}).round(4) * 100
 
-                        # Write results to CSV
-                        csvwriter.writerow(row)
+for ship_type in ship_type_accuracy.index:
+    print(f"\n  {ship_type}:")
+    for col in ship_type_accuracy.columns:
+        answer_type = col.replace('correct_', '').replace('_', ' ').title()
+        print(f"    {answer_type}: {ship_type_accuracy.loc[ship_type, col]:.2f}%")
 
-                    except Exception as e:
-                        print(f"Error processing {image_name} for {question}: {e}")
-                        row.append('ERROR')
-                        csvwriter.writerow(row)
-                        continue
+# (2b) Accuracy by country
+print("\n2b. ACCURACY BY COUNTRY:")
+print("-" * 50)
+country_accuracy = df.groupby('gt_country').agg({
+    'correct_country': 'mean',
+    'correct_ship_type': 'mean',
+    'correct_ship_name': 'mean',
+    'correct_hull_number': 'mean'
+}).round(4) * 100
 
-    print("Done! Results saved to", output_csv)
+for country in country_accuracy.index:
+    print(f"\n  {country}:")
+    for col in country_accuracy.columns:
+        answer_type = col.replace('correct_', '').replace('_', ' ').title()
+        print(f"    {answer_type}: {country_accuracy.loc[country, col]:.2f}%")
 
-# After looping through all the images, calculate precision, recall, and F1 scores
-precision, recall, f1 = calculate_metrics(all_labels, all_preds)
+# (3) Accuracy by resize factor
+print("\n3. ACCURACY BY RESIZE FACTOR:")
+print("-" * 50)
+resize_accuracy = df.groupby('resize_factor').agg({
+    'correct_country': 'mean',
+    'correct_ship_type': 'mean',
+    'correct_ship_name': 'mean',
+    'correct_hull_number': 'mean'
+}).round(4) * 100
 
-# Print the final metrics
-print(f"Precision: {precision}")
-print(f"Recall: {recall}")
-print(f"F1 Score: {f1}")
+for resize in resize_accuracy.index:
+    print(f"\n  Resize Factor {resize}:")
+    for col in resize_accuracy.columns:
+        answer_type = col.replace('correct_', '').replace('_', ' ').title()
+        print(f"    {answer_type}: {resize_accuracy.loc[resize, col]:.2f}%")
 
-# Aggregated metrics for each category
-df = pd.read_csv(output_csv)
-type_accuracy = df.groupby('type')['accuracy'].mean()
-country_accuracy = df.groupby('country')['accuracy'].mean()
-resize_accuracy = df.groupby('resize_factor')['accuracy'].mean()
-prompt_accuracy = df.groupby('prompt_method')['accuracy'].mean()
+# (3a) Accuracy by ship type for each resize factor
+print("\n3a. ACCURACY BY SHIP TYPE FOR EACH RESIZE FACTOR:")
+print("-" * 50)
+for resize in sorted(df['resize_factor'].unique()):
+    print(f"\n  Resize Factor {resize}:")
+    resize_df = df[df['resize_factor'] == resize]
+    ship_type_resize = resize_df.groupby('gt_ship_type').agg({
+        'correct_country': 'mean',
+        'correct_ship_type': 'mean',
+        'correct_ship_name': 'mean',
+        'correct_hull_number': 'mean'
+    }).round(4) * 100
+    
+    for ship_type in ship_type_resize.index:
+        print(f"    {ship_type}:")
+        for col in ship_type_resize.columns:
+            answer_type = col.replace('correct_', '').replace('_', ' ').title()
+            print(f"      {answer_type}: {ship_type_resize.loc[ship_type, col]:.2f}%")
 
-# Save aggregated metrics to Excel
-with pd.ExcelWriter('vqa_metrics.xlsx') as writer:
-    type_accuracy.to_excel(writer, sheet_name='Ship Type Accuracy')
-    country_accuracy.to_excel(writer, sheet_name='Country Accuracy')
-    resize_accuracy.to_excel(writer, sheet_name='Resize Accuracy')
-    prompt_accuracy.to_excel(writer, sheet_name='Prompt Accuracy')
+# (3b) Accuracy by country for each resize factor
+print("\n3b. ACCURACY BY COUNTRY FOR EACH RESIZE FACTOR:")
+print("-" * 50)
+for resize in sorted(df['resize_factor'].unique()):
+    print(f"\n  Resize Factor {resize}:")
+    resize_df = df[df['resize_factor'] == resize]
+    country_resize = resize_df.groupby('gt_country').agg({
+        'correct_country': 'mean',
+        'correct_ship_type': 'mean',
+        'correct_ship_name': 'mean',
+        'correct_hull_number': 'mean'
+    }).round(4) * 100
+    
+    for country in country_resize.index:
+        print(f"    {country}:")
+        for col in country_resize.columns:
+            answer_type = col.replace('correct_', '').replace('_', ' ').title()
+            print(f"      {answer_type}: {country_resize.loc[country, col]:.2f}%")
 
-# Additional summary metrics (precision, recall, f1)
-summary_df = pd.DataFrame({
-    'Metric': ['Precision', 'Recall', 'F1 Score'],
-    'Value': [precision, recall, f1]
-})
+# (4) Accuracy by prompt method
+print("\n4. ACCURACY BY PROMPT METHOD:")
+print("-" * 50)
+prompt_accuracy = df.groupby('prompt_method').agg({
+    'correct_country': 'mean',
+    'correct_ship_type': 'mean',
+    'correct_ship_name': 'mean',
+    'correct_hull_number': 'mean'
+}).round(4) * 100
 
-# Save to Excel
-with pd.ExcelWriter('vqa_metrics.xlsx', mode='a') as writer:
-    summary_df.to_excel(writer, sheet_name='Summary Metrics')
+for method in prompt_accuracy.index:
+    print(f"\n  {method}:")
+    for col in prompt_accuracy.columns:
+        answer_type = col.replace('correct_', '').replace('_', ' ').title()
+        print(f"    {answer_type}: {prompt_accuracy.loc[method, col]:.2f}%")
 
-print("Aggregated results and metrics saved to vqa_metrics.xlsx")
+# (4a) Accuracy by ship type for each prompt method
+print("\n4a. ACCURACY BY SHIP TYPE FOR EACH PROMPT METHOD:")
+print("-" * 50)
+for method in sorted(df['prompt_method'].unique()):
+    print(f"\n  {method}:")
+    method_df = df[df['prompt_method'] == method]
+    ship_type_method = method_df.groupby('gt_ship_type').agg({
+        'correct_country': 'mean',
+        'correct_ship_type': 'mean',
+        'correct_ship_name': 'mean',
+        'correct_hull_number': 'mean'
+    }).round(4) * 100
+    
+    for ship_type in ship_type_method.index:
+        print(f"    {ship_type}:")
+        for col in ship_type_method.columns:
+            answer_type = col.replace('correct_', '').replace('_', ' ').title()
+            print(f"      {answer_type}: {ship_type_method.loc[ship_type, col]:.2f}%")
+
+# (4b) Accuracy by country for each prompt method
+print("\n4b. ACCURACY BY COUNTRY FOR EACH PROMPT METHOD:")
+print("-" * 50)
+for method in sorted(df['prompt_method'].unique()):
+    print(f"\n  {method}:")
+    method_df = df[df['prompt_method'] == method]
+    country_method = method_df.groupby('gt_country').agg({
+        'correct_country': 'mean',
+        'correct_ship_type': 'mean',
+        'correct_ship_name': 'mean',
+        'correct_hull_number': 'mean'
+    }).round(4) * 100
+    
+    for country in country_method.index:
+        print(f"    {country}:")
+        for col in country_method.columns:
+            answer_type = col.replace('correct_', '').replace('_', ' ').title()
+            print(f"      {answer_type}: {country_method.loc[country, col]:.2f}%")
+
+# Save detailed results to Excel
+print("\n" + "="*80)
+print("Saving detailed results to Excel...")
+
+with pd.ExcelWriter('vqa_detailed_results.xlsx', engine='openpyxl') as writer:
+    # Raw results
+    df.to_excel(writer, sheet_name='Raw Results', index=False)
+    
+    # Overall accuracy
+    overall_acc = pd.DataFrame({
+        'Answer Type': ['Country', 'Ship Type', 'Ship Name', 'Hull Number'],
+        'Accuracy (%)': [
+            df['correct_country'].mean() * 100,
+            df['correct_ship_type'].mean() * 100,
+            df['correct_ship_name'].mean() * 100,
+            df['correct_hull_number'].mean() * 100
+        ]
+    })
+    overall_acc.to_excel(writer, sheet_name='Overall Accuracy', index=False)
+    
+    # By ship type
+    ship_type_accuracy.to_excel(writer, sheet_name='By Ship Type')
+    
+    # By country
+    country_accuracy.to_excel(writer, sheet_name='By Country')
+    
+    # By resize factor
+    resize_accuracy.to_excel(writer, sheet_name='By Resize Factor')
+    
+    # By prompt method
+    prompt_accuracy.to_excel(writer, sheet_name='By Prompt Method')
+
+print("Detailed results saved to vqa_detailed_results.xlsx")
+print("\n" + "="*80)
+print("ANALYSIS COMPLETE!")
+print("="*80)
